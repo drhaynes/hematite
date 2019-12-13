@@ -1,6 +1,8 @@
-use std::cell::Cell;
-use std::old_io::{ File, FileStat, IoResult };
-use std::os;
+use std::cell::RefCell;
+use std::io;
+use std::path::Path;
+use gfx;
+use memmap::{Mmap, Protection};
 
 use array::*;
 use chunk::{
@@ -15,73 +17,48 @@ use chunk::{
 use minecraft::nbt::Nbt;
 
 pub struct Region {
-    mmap: os::MemoryMap,
+    mmap: Mmap,
 }
 
 fn array_16x16x16<T, F>(mut f: F) -> [[[T; SIZE]; SIZE]; SIZE]
     where F: FnMut(usize, usize, usize) -> T
 {
-    Array::from_fn(|y| -> [[T; SIZE]; SIZE]
-        Array::from_fn(|z| -> [T; 16]
+    Array::from_fn(|y| -> [[T; SIZE]; SIZE] {
+        Array::from_fn(|z| -> [T; 16] {
             Array::from_fn(|x| f(x, y, z))
-        )
-    )
+        })
+    })
 }
 
 impl Region {
-    pub fn open(filename: &Path) -> IoResult<Region> {
-        #[cfg(not(windows))]
-        fn map_fd(file: &File) -> os::MapOption {
-            use std::os::unix::AsRawFd;
-            os::MapOption::MapFd(file.as_raw_fd())
-        }
-
-        #[cfg(windows)]
-        fn map_fd(file: &File) -> os::MapOption {
-            use std::os::windows::AsRawHandle;
-            os::MapOption::MapFd(file.as_raw_handle())
-        }
-
-        let file = try!(File::open(filename));
-        let stat: FileStat = try!(file.stat());
-        let min_len = stat.size as usize;
-        let options = &[
-            map_fd(&file),
-            os::MapOption::MapReadable
-        ];
-        let res = Region {
-            mmap: os::MemoryMap::new(min_len, options).unwrap()
-        };
-        Ok(res)
+    pub fn open(filename: &Path) -> io::Result<Region> {
+        let mmap = try!(Mmap::open_path(filename, Protection::Read));
+        Ok(Region{mmap: mmap})
     }
 
-    fn as_slice<'a>(&'a self) -> &'a [u8] {
-        use std::mem;
-        use std::raw::Slice;
-        let slice = Slice {
-                data: self.mmap.data() as *const u8,
-                len: self.mmap.len()
-            };
-
-        unsafe { mem::transmute(slice) }
+    fn as_slice(&self) -> &[u8] {
+        unsafe {
+            self.mmap.as_slice()
+        }
     }
 
-    pub fn get_chunk_column(&self, x: u8, z: u8) -> Option<ChunkColumn> {
-        let locations = self.as_slice().slice_to(4096);
+    pub fn get_chunk_column<R: gfx::Resources>(&self, x: u8, z: u8)
+                            -> Option<ChunkColumn<R>> {
+        let locations = &self.as_slice()[..4096];
         let i = 4 * ((x % 32) as usize + (z % 32) as usize * 32);
         let start = ((locations[i] as usize) << 16)
                   | ((locations[i + 1] as usize) << 8)
                   | (locations[i + 2] as usize);
         let num = locations[i + 3] as usize;
         if start == 0 || num == 0 { return None; }
-        let sectors = self.as_slice().slice(start * 4096, (start + num) * 4096);
+        let sectors = &self.as_slice()[start * 4096 .. (start + num) * 4096];
         let len = ((sectors[0] as usize) << 24)
                 | ((sectors[1] as usize) << 16)
                 | ((sectors[2] as usize) << 8)
                 | (sectors[3] as usize);
         let nbt = match sectors[4] {
-            1 => Nbt::from_gzip(sectors.slice(5, 4 + len)),
-            2 => Nbt::from_zlib(sectors.slice(5, 4 + len)),
+            1 => Nbt::from_gzip(&sectors[5 .. 4 + len]),
+            2 => Nbt::from_zlib(&sectors[5 .. 4 + len]),
             c => panic!("unknown region chunk compression method {}", c)
         };
 
@@ -129,10 +106,8 @@ impl Region {
                     }
                 }),
             };
-            let len = chunks.len();
-            if y as usize >= len {
-                //chunks.reserve(y as usize - len + 1);
-                chunks.resize(y as usize + 1, *EMPTY_CHUNK);
+            while chunks.len() <= y as usize {
+                chunks.push(*EMPTY_CHUNK);
             }
             chunks[y as usize] = chunk;
         }
@@ -140,12 +115,14 @@ impl Region {
             .unwrap().as_bytearray().unwrap();
         Some(ChunkColumn {
             chunks: chunks,
-            buffers: Array::from_fn(|_| Cell::new(None)),
-            biomes: Array::from_fn(|z| -> [BiomeId; SIZE] Array::from_fn(|x| {
-                BiomeId {
-                    value: biomes[z * SIZE + x]
-                }
-            }))
+            buffers: Array::from_fn(|_| RefCell::new(None)),
+            biomes: Array::from_fn(|z| -> [BiomeId; SIZE] {
+                Array::from_fn(|x| {
+                    BiomeId {
+                        value: biomes[z * SIZE + x]
+                    }
+                })
+            })
         })
     }
 }

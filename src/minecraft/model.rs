@@ -1,19 +1,19 @@
 use std::collections::HashMap;
 use std::collections::hash_map::Entry::{ Occupied, Vacant };
-use std::f32::consts::{PI, SQRT2};
+use std::f32::consts::{PI, SQRT_2};
 use std::f32::INFINITY;
-use std::old_io::fs::File;
-use std::num::Float;
+use std::fs::File;
+use std::path::Path;
 use std::str::FromStr;
 
 use self::OrthoRotation::*;
 
 use array::*;
 use cube;
-use serialize::json;
-use texture::AtlasBuilder;
+use rustc_serialize::json;
+use gfx_voxel::texture::AtlasBuilder;
 
-#[derive(Copy)]
+#[derive(Copy, Clone)]
 pub struct Vertex {
     pub xyz: [f32; 3],
     pub uv: [f32; 2]
@@ -27,7 +27,7 @@ pub enum Tint {
     Redstone
 }
 
-#[derive(Copy)]
+#[derive(Copy, Clone)]
 pub enum OrthoRotation {
     Rotate0,
     Rotate90,
@@ -47,16 +47,12 @@ impl OrthoRotation {
     }
 }
 
-#[derive(Copy)]
+#[derive(Copy, Clone)]
 pub struct Face {
     pub vertices: [Vertex; 4],
     pub tint: bool,
     pub cull_face: Option<cube::Face>,
     pub ao_face: Option<cube::Face>
-}
-
-impl Clone for Face {
-    fn clone(&self) -> Face { *self }
 }
 
 #[derive(Clone)]
@@ -102,7 +98,7 @@ fn array3_num<T, F>(json: &json::Json, mut f: F) -> [T; 3] where F: FnMut(f64) -
     Array::from_iter(json.as_array().unwrap().iter().map(|x| f(x.as_f64().unwrap())))
 }
 
-fn clone_parent(m: &PartialModel, a: &mut AtlasBuilder) -> PartialModel {
+fn clone_parent(m: &PartialModel, _a: &mut AtlasBuilder) -> PartialModel {
     m.clone()
 }
 
@@ -116,7 +112,7 @@ impl PartialModel {
             Some(model) => return f(model, atlas),
             None => {}
         }
-        let path = assets.join(Path::new(format!("minecraft/models/{}.json", name).as_slice()));
+        let path = assets.join(Path::new(&format!("minecraft/models/{}.json", name)));
         let obj = json::Json::from_reader(&mut File::open(&path).unwrap()).unwrap();
 
         let mut model = match obj.find("parent").and_then(|x| x.as_string()) {
@@ -139,8 +135,8 @@ impl PartialModel {
         match obj.find("textures").and_then(|x| x.as_object()) {
             Some(textures) => for (name, tex) in textures.iter() {
                 let tex = tex.as_string().unwrap();
-                let tex = if tex.starts_with("#") {
-                    PartialTexture::Variable(tex.slice_from(1).to_string())
+                let tex = if tex.starts_with('#') {
+                    PartialTexture::Variable(tex[1..].to_string())
                 } else {
                     let (u, v) = atlas.load(tex);
                     PartialTexture::Coords(u as f32, v as f32)
@@ -150,7 +146,7 @@ impl PartialModel {
             None => {}
         }
 
-        match obj.find("elements").and_then(|x: &json::Json| x.as_array().map(|x| x.clone())) {
+        match obj.find("elements").and_then(|x: &json::Json| x.as_array().cloned()) {
             Some(elements) => for element in elements.iter().map(|x| x) {
                 let from = array3_num(element.find("from").unwrap(), |x| x as f32 / 16.0);
                 let to = array3_num(element.find("to").unwrap(), |x| x as f32 / 16.0);
@@ -160,21 +156,22 @@ impl PartialModel {
                 let element_start = model.faces.len();
 
                 for (k, v) in element.find("faces").unwrap().as_object().unwrap().iter() {
-                    let face: cube::Face = FromStr::from_str(k.as_slice()).unwrap();
-                    let [u0, v0, u1, v1] = match v.find("uv") {
+                    let face: cube::Face = k.parse().unwrap();
+                    let temp = match v.find("uv") {
                         Some(uv) => {
                             Array::from_iter(uv.as_array().unwrap().iter().map(|x| x.as_f64().unwrap() as f32))
                         }
                         None => match face {
-                            cube::West  | cube::East  => [from[2], from[1], to[2], to[1]],
-                            cube::Down  | cube::Up    => [from[0], from[2], to[0], to[2]],
-                            cube::North | cube::South => [from[0], from[1], to[0], to[1]]
+                                cube::West  | cube::East  => [from[2], from[1], to[2], to[1]],
+                                cube::Down  | cube::Up    => [from[0], from[2], to[0], to[2]],
+                                cube::North | cube::South => [from[0], from[1], to[0], to[1]]
                         }.map(|x| x * 16.0)
                     };
+                    let (u0, v0, u1, v1) = (temp[0], temp[1], temp[2], temp[3]);
 
                     let tex = v.find("texture").unwrap().as_string().unwrap();
                     assert!(tex.starts_with("#"));
-                    let tex = tex.slice_from(1).to_string();
+                    let tex = tex[1..].to_string();
 
                     let cull_face = v.find("cullface").map(|s| {
                         FromStr::from_str(s.as_string().unwrap()).unwrap()
@@ -204,19 +201,21 @@ impl PartialModel {
 
                     let xyz = face.vertices(from, scale);
                     // Swap vertical texture coordinates.
-                    let [v0, v1] = [v1, v0];
+                    let (v0, v1) = (v1, v0);
                     // Bring texture coordinates closer to avoid seams.
                     let u_center = (u0 + u1) / 2.0;
-                    let [u0, u1] = [u0, u1].map(|u| u - (u - u_center).signum() / 128.0);
+                    let us = [u0, u1].map(|u| u - (u - u_center).signum() / 128.0);
+                    let (u0, u1) = (us[0], us[1]);
                     let v_center = (v0 + v1) / 2.0;
-                    let [v0, v1] = [v0, v1].map(|v| v - (v - v_center).signum() / 128.0);
+                    let vs = [v0, v1].map(|v| v - (v - v_center).signum() / 128.0);
+                    let (v0, v1) = (vs[0], vs[1]);
                     // Clockwise quad (from bottom-right to top-right).
                     let uvs = [
-                        [u1, v0],
-                        [u0, v0],
-                        [u0, v1],
-                        [u1, v1]
-                    ].map(|[u, v]| match rotation {
+                        (u1, v0),
+                        (u0, v0),
+                        (u0, v1),
+                        (u1, v1)
+                    ].map(|(u, v)| match rotation {
                         Rotate0 => [u, v],
                         Rotate90 => [v, 16.0 - u],
                         Rotate180 => [16.0 - u, 16.0 - v],
@@ -240,20 +239,20 @@ impl PartialModel {
 
                         let (s, c) = (angle.sin(), angle.cos());
                         let mut rot = |ix: usize, iy: usize| {
-                            for &mut (ref mut face, _) in model.faces.slice_from_mut(element_start).iter_mut() {
+                            for &mut (ref mut face, _) in model.faces[element_start..].iter_mut() {
                                 face.ao_face = None;
 
-                                let [ox, oy] = [origin[ix], origin[iy]];
+                                let (ox, oy) = (origin[ix], origin[iy]);
                                 for v in face.vertices.iter_mut() {
-                                    let [x, y] = [v.xyz[ix] - ox, v.xyz[iy] - oy];
+                                    let (x, y) = (v.xyz[ix] - ox, v.xyz[iy] - oy);
                                     v.xyz[ix] = x * c + y * s;
                                     v.xyz[iy] =-x * s + y * c;
                                 }
 
                                 if rescale {
                                     for v in face.vertices.iter_mut() {
-                                        v.xyz[ix] *= SQRT2;
-                                        v.xyz[iy] *= SQRT2;
+                                        v.xyz[ix] *= SQRT_2;
+                                        v.xyz[iy] *= SQRT_2;
                                     }
                                 }
 
@@ -286,10 +285,10 @@ impl PartialModel {
 impl Model {
     pub fn load(name: &str, assets: &Path, atlas: &mut AtlasBuilder,
                 cache: &mut HashMap<String, PartialModel>) -> Model {
-        PartialModel::load(format!("block/{}", name).as_slice(), assets, atlas, cache, |partial, atlas| {
+        PartialModel::load(&format!("block/{}", name), assets, atlas, cache, |partial, atlas| {
             let mut faces: Vec<Face> = partial.faces.iter().map(|&(mut face, ref tex)| {
                 fn texture_coords(textures: &HashMap<String, PartialTexture>,
-                                  tex: &String) -> Option<(f32, f32)> {
+                                  tex: &str) -> Option<(f32, f32)> {
                     match textures.get(tex) {
                         Some(&PartialTexture::Variable(ref tex)) => texture_coords(textures, tex),
                         Some(&PartialTexture::Coords(u, v)) => Some((u, v)),
@@ -314,7 +313,7 @@ impl Model {
                     let (mut min_u, mut min_v) = (INFINITY, INFINITY);
                     let (mut max_u, mut max_v) = (0.0, 0.0);
                     for vertex in faces[i].vertices.iter() {
-                        let [u, v] = vertex.uv;
+                        let (u, v) = (vertex.uv[0], vertex.uv[1]);
                         min_u = u.min(min_u);
                         min_v = v.min(min_v);
                         max_u = u.max(max_u);
@@ -334,13 +333,13 @@ impl Model {
                 }
             }
 
-            if !partial.no_ambient_occlusion {
-                if faces.iter().any(|f| f.ao_face.is_none()) {
-                    println!("Warning: model {} uses AO but has faces which are unsuitable", name);
-                }
-            } else {
+            if partial.no_ambient_occlusion {
                 for face in faces.iter_mut() {
                     face.ao_face = None;
+                }
+            } else {
+                if faces.iter().any(|f| f.ao_face.is_none()) {
+                    println!("Warning: model {} uses AO but has faces which are unsuitable", name);
                 }
             }
 
@@ -383,4 +382,3 @@ impl Model {
         self.faces.is_empty()
     }
 }
-

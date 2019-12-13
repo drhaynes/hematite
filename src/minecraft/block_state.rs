@@ -1,30 +1,29 @@
 use std::borrow::Cow;
 use std::cmp::max;
-use std::collections::hash_map::Entry::{ Occupied, Vacant };
+use std::collections::hash_map::Entry::{Occupied, Vacant};
 use std::collections::HashMap;
-use std::old_io::fs::File;
-use std::num::Float;
-use std::num::UnsignedInt;
+use std::fs::File;
+use std::path::Path;
+use std::num::Wrapping;
 
 use array::*;
 use chunk::{BiomeId, BlockState, Chunk};
 use cube;
-use gfx::Device;
+use gfx;
+use gfx_voxel::texture::{AtlasBuilder, ImageSize, Texture};
 use minecraft::biome::Biomes;
 use minecraft::data::BLOCK_STATES;
-use minecraft::model;
 use minecraft::model::OrthoRotation::*;
-use minecraft::model::{ Model, OrthoRotation };
-use serialize::json;
+use minecraft::model::{self, Model, OrthoRotation};
+use rustc_serialize::json;
 use shader::Vertex;
-use texture::{ AtlasBuilder, Texture };
 use vecmath::vec3_add;
 
 use self::PolymorphDecision::*;
 
-pub struct BlockStates {
-    models: Vec<ModelAndBehavior>,
-    texture: Texture
+pub struct BlockStates<R: gfx::Resources> {
+    pub models: Vec<ModelAndBehavior>,
+    pub texture: Texture<R>,
 }
 
 #[derive(PartialEq, Eq, Clone, Copy)]
@@ -86,7 +85,7 @@ pub enum PolymorphDecision {
 struct Description {
     id: u16,
     name: &'static str,
-    variant: Cow<'static, String, str>,
+    variant: Cow<'static, str>,
     random_offset: RandomOffset,
     polymorph_oracle: Vec<PolymorphDecision>
 }
@@ -112,10 +111,11 @@ impl ModelAndBehavior {
     }
 }
 
-impl BlockStates {
-    pub fn load<D: Device>(
-        assets: &Path, d: &mut D
-    ) -> BlockStates {
+impl<R: gfx::Resources> BlockStates<R> {
+
+    pub fn load<F: gfx::Factory<R>>(
+        assets: &Path, f: &mut F
+    ) -> BlockStates<R> {
         let mut last_id = BLOCK_STATES.last().map_or(0, |state| state.0);
         let mut states = Vec::<Description>::with_capacity(BLOCK_STATES.len().next_power_of_two());
         let mut extras = vec![];
@@ -132,14 +132,14 @@ impl BlockStates {
                 }
                 let (_, lower_name, lower_variant) = BLOCK_STATES[i - 1];
                 assert!(lower_name == name && lower_variant == "half=lower");
-                let lower = BLOCK_STATES.slice_to(i - 1).iter().enumerate().rev();
+                let lower = BLOCK_STATES[.. i - 1].iter().enumerate().rev();
                 let lower = lower.take_while(|&(i, &(id, _, variant))| {
                     id + 1 == BLOCK_STATES[i + 1].0 && variant == "half=lower"
                 });
                 // Note: excluding paeonia itself, which works as-is.
                 let num_plants = lower.count();
 
-                for j in range(i - 1 - num_plants, i - 1) {
+                for j in i - 1 - num_plants..i - 1 {
                     last_id += 1;
                     let (_, lower_name, _) = BLOCK_STATES[j];
                     extras.push(Description {
@@ -152,10 +152,12 @@ impl BlockStates {
                     states[j].random_offset = RandomOffset::XZ;
 
                     let next_index = polymorph_oracle.len() as u8;
-                    polymorph_oracle.push_all(&[
-                        IfBlock(Dir::Down, (BLOCK_STATES[j].0 - id) as i8, next_index + 2),
-                        PickBlockState(last_id)
-                    ]);
+                    polymorph_oracle.push(IfBlock(
+                        Dir::Down,
+                        (BLOCK_STATES[j].0.wrapping_sub(id)) as i8,
+                        next_index.wrapping_add(2)
+                    ));
+                    polymorph_oracle.push(PickBlockState(last_id));
                 }
                 random_offset = RandomOffset::XZ;
                 polymorph_oracle.push(PickBlockState(id));
@@ -174,7 +176,7 @@ impl BlockStates {
             }
 
             let variant = if variant.ends_with(",shape=outer_right") {
-                Cow::Owned(format!("{}=straight", variant.slice_to(variant.len() - 12)))
+                Cow::Owned(format!("{}=straight", &variant[..variant.len() - 12]))
             } else {
                 Cow::Borrowed(variant)
             };
@@ -189,13 +191,13 @@ impl BlockStates {
         }
         states.extend(extras.into_iter());
 
-        BlockStates::load_with_states(assets, d, states)
+        BlockStates::load_with_states(assets, f, states)
     }
 
-    fn load_with_states<D: Device>(
-        assets: &Path, d: &mut D,
+    fn load_with_states<F: gfx::Factory<R>>(
+        assets: &Path, f: &mut F,
         states: Vec<Description>
-    ) -> BlockStates {
+    ) -> BlockStates<R> {
         struct Variant {
             model: String,
             rotate_x: OrthoRotation,
@@ -214,7 +216,7 @@ impl BlockStates {
                 Occupied(entry) => entry.into_mut(),
                 Vacant(entry) => entry.insert({
                     let name = state.name;
-                    let path = assets.join(Path::new(format!("minecraft/blockstates/{}.json", name).as_slice()));
+                    let path = assets.join(Path::new(&format!("minecraft/blockstates/{}.json", name)));
                     match json::Json::from_reader(&mut File::open(&path).unwrap()).unwrap() {
                         json::Json::Object(mut json) => match json.remove("variants").unwrap() {
                             json::Json::Object(variants) => variants.into_iter().map(|(k, v)| {
@@ -269,22 +271,23 @@ impl BlockStates {
                 Cow::Owned(ref variant) => variants.get(variant),
                 Cow::Borrowed(variant) => variants.get(variant)
             }.unwrap();
-            let mut model = Model::load(variant.model.as_slice(), assets,
+            let mut model = Model::load(&variant.model, assets,
                                         &mut atlas, &mut partial_model_cache);
 
-            let rotate_faces = |&: m: &mut Model, ix: usize, iy: usize, rot_mat: [i32; 4]| {
-                let [a, b, c, d] = rot_mat.map(|x: i32| x as f32);
+            let rotate_faces = |m: &mut Model, ix: usize, iy: usize, rot_mat: [i32; 4]| {
+                let (a, b, c, d) = (rot_mat[0] as f32, rot_mat[1] as f32,
+                                    rot_mat[2] as f32, rot_mat[3] as f32);
                 for face in m.faces.iter_mut() {
                     for vertex in face.vertices.iter_mut() {
                         let xyz = &mut vertex.xyz;
-                        let [x, y] = [ix, iy].map(|i| xyz[i] - 0.5);
+                        let (x, y) = (xyz[ix] - 0.5, xyz[iy] - 0.5);
                         xyz[ix] = a * x + b * y + 0.5;
                         xyz[iy] = c * x + d * y + 0.5;
                     }
-                    let fixup_cube_face = |&: f: cube::Face| {
-                        let [a, b, c, d] = rot_mat;
+                    let fixup_cube_face = |f: cube::Face| {
+                        let (a, b, c, d) = (rot_mat[0], rot_mat[1], rot_mat[2], rot_mat[3]);
                         let mut dir = f.direction();
-                        let [x, y] = [dir[ix], dir[iy]];
+                        let (x, y) = (dir[ix], dir[iy]);
                         dir[ix] = a * x + b * y;
                         dir[iy] = c * x + d * y;
                         cube::Face::from_direction(dir).unwrap()
@@ -311,10 +314,11 @@ impl BlockStates {
                         let uvs = face.vertices.map(|x| x.uv);
                         let uv_min = [0, 1].map(|i| (uvs[0][i]).min(uvs[1][i])
                                                 .min(uvs[2][i]).min(uvs[3][i]));
-                        let [u_base, v_base] = uv_min.map(|x| (x / 16.0).floor() * 16.0);
+                        let temp = uv_min.map(|x| (x / 16.0).floor() * 16.0);
+                        let (u_base, v_base) = (temp[0], temp[1]);
                         for vertex in face.vertices.iter_mut() {
                             let uv = &mut vertex.uv;
-                            let [u, v] = [uv[0] - u_base, uv[1] - v_base].map(|x| x - 8.0);
+                            let (u, v) = (uv[0] - u_base - 8.0, uv[1] - v_base - 8.0);
                             uv[0] = a * u - b * v + 8.0 + u_base;
                             uv[1] =-c * u + d * v + 8.0 + v_base;
                         }
@@ -322,7 +326,7 @@ impl BlockStates {
                 }
             };
 
-            let rotate_faces = |&: m: &mut Model, ix: usize, iy: usize, r: OrthoRotation| {
+            let rotate_faces = |m: &mut Model, ix: usize, iy: usize, r: OrthoRotation| {
                 match r {
                     Rotate0 => {}
                     Rotate90 =>  rotate_faces(m, ix, iy, [ 0, -1,
@@ -337,9 +341,8 @@ impl BlockStates {
             rotate_faces(&mut model, 2, 1, variant.rotate_x);
             rotate_faces(&mut model, 0, 2, variant.rotate_y);
 
-            let len = models.len();
-            if state.id as usize >= len {
-                models.resize(state.id as usize + 1, ModelAndBehavior::empty());
+            while models.len() <= state.id as usize {
+                models.push(ModelAndBehavior::empty());
             }
 
             models[state.id as usize] = ModelAndBehavior {
@@ -352,7 +355,7 @@ impl BlockStates {
         drop(partial_model_cache);
         drop(block_state_cache);
 
-        let texture = atlas.complete(d);
+        let texture = atlas.complete(f);
         let (width, height) = texture.get_size();
         let u_unit = 1.0 / (width as f32);
         let v_unit = 1.0 / (height as f32);
@@ -372,7 +375,7 @@ impl BlockStates {
         }
     }
 
-    pub fn get_model<'a>(&'a self, i: BlockState) -> Option<&'a ModelAndBehavior> {
+    pub fn get_model(&self, i: BlockState) -> Option<&ModelAndBehavior> {
         let i = i.value as usize;
         if i >= self.models.len() || self.models[i].is_empty() {
             None
@@ -381,7 +384,7 @@ impl BlockStates {
         }
     }
 
-    pub fn texture<'a>(&'a self) -> &'a Texture {
+    pub fn texture(&self) -> &Texture<R> {
         &self.texture
     }
 
@@ -395,18 +398,23 @@ impl BlockStates {
     }
 }
 
-pub fn fill_buffer(block_states: &BlockStates, biomes: &Biomes, buffer: &mut Vec<Vertex>,
+pub fn fill_buffer<R: gfx::Resources>(block_states: &BlockStates<R>,
+                   biomes: &Biomes, buffer: &mut Vec<Vertex>,
                    coords: [i32; 3], chunks: [[[&Chunk; 3]; 3]; 3],
                    column_biomes: [[Option<&[[BiomeId; 16]; 16]>; 3]; 3]) {
     let chunk_xyz = coords.map(|x| x as f32 * 16.0);
-    for y in range(0, 16) {
-        for z in range(0, 16) {
-            for x in range(0, 16) {
-                let at = |&: dir: [i32; 3]| {
-                    let [dx, dy, dz] = dir.map(|x| x as usize);
-                    let [x, y, z] = [x + dx, y + dy, z + dz].map(|x| x + 16);
+    for y in 0..16_usize {
+        for z in 0..16_usize {
+            for x in 0..16_usize {
+                let at = |dir: [i32; 3]| {
+                    let (dx, dy, dz) = (dir[0] as usize, dir[1] as usize, dir[2] as usize);
+                    let (x, y, z) = (
+                        x.wrapping_add(dx).wrapping_add(16),
+                        y.wrapping_add(dy).wrapping_add(16),
+                        z.wrapping_add(dz).wrapping_add(16)
+                    );
                     let chunk = chunks[y / 16][z / 16][x / 16];
-                    let [x, y, z] = [x, y, z].map(|x| x % 16);
+                    let (x, y, z) = (x % 16, y % 16, z % 16);
                     (chunk.blocks[y][z][x], chunk.light_levels[y][z][x])
                 };
                 let this_block = at([0, 0, 0]).0;
@@ -415,17 +423,17 @@ pub fn fill_buffer(block_states: &BlockStates, biomes: &Biomes, buffer: &mut Vec
                         let mut i = 0;
                         let result;
                         loop {
-                            let (cond, idx) = match model.polymorph_oracle[i].clone() {
+                            let (cond, idx) = match model.polymorph_oracle[i] {
                                 PickBlockState(id) => {
                                     result = &block_states.models[id as usize];
                                     break;
                                 }
                                 IfBlock(dir, offset, idx) => {
-                                    let id = this_block.value + offset as u16;
+                                    let id = this_block.value.wrapping_add(offset as u16);
                                     (at(dir.xyz()).0.value == id, idx)
                                 }
                                 IfBlockOrSolid(dir, offset, idx) => {
-                                    let id = this_block.value + offset as u16;
+                                    let id = this_block.value.wrapping_add(offset as u16);
                                     let other = at(dir.xyz()).0;
                                     (other.value == id ||
                                      block_states.get_opacity(other).is_opaque(), idx)
@@ -452,16 +460,16 @@ pub fn fill_buffer(block_states: &BlockStates, biomes: &Biomes, buffer: &mut Vec
                     None => continue
                 };
                 let block_xyz = vec3_add([x, y, z].map(|x| x as f32), chunk_xyz);
-                let block_xyz = match model.random_offset.clone() {
+                let block_xyz = match model.random_offset {
                     RandomOffset::None => block_xyz,
                     random_offset => {
-                        let [x, _, z] = block_xyz;
-                        let seed = (x as i32 * 3129871) as i64 ^ (z as i64) * 116129781;
-                        let value = seed * seed * 42317861 + seed * 11;
-                        let ox = (((value >> 16) & 15) as f32 / 15.0 - 0.5) * 0.5;
-                        let oz = (((value >> 24) & 15) as f32 / 15.0 - 0.5) * 0.5;
+                        let (x, z) = (block_xyz[0], block_xyz[2]);
+                        let seed = Wrapping((Wrapping(x as i32) * Wrapping(3129871)).0 as i64) ^ Wrapping(z as i64) * Wrapping(116129781);
+                        let value = seed * seed * Wrapping(42317861) + seed * Wrapping(11);
+                        let ox = (((value.0 >> 16) & 15) as f32 / 15.0 - 0.5) * 0.5;
+                        let oz = (((value.0 >> 24) & 15) as f32 / 15.0 - 0.5) * 0.5;
                         let oy = if random_offset == RandomOffset::XYZ {
-                            (((value >> 20) & 15) as f32 / 15.0 - 1.0) * 0.2
+                            (((value.0 >> 20) & 15) as f32 / 15.0 - 1.0) * 0.2
                         } else { 0.0 };
                         vec3_add(block_xyz, [ox, oy, oz])
                     }
@@ -494,8 +502,8 @@ pub fn fill_buffer(block_states: &BlockStates, biomes: &Biomes, buffer: &mut Vec
                         let mut rgb = rgb.map(|x: u8| x as f32 / 255.0);
                         let (mut sum_light_level, mut num_light_level) = (0.0, 0.0);
 
-                        let rounded_vertex_xyz = vertex.xyz.map(|x| x.round() as i32);
-                        let [dx, dy, dz] = rounded_vertex_xyz;
+                        let rounded_xyz = vertex.xyz.map(|x| x.round() as i32);
+                        let (dx, dy, dz) = (rounded_xyz[0], rounded_xyz[1], rounded_xyz[2]);
                         for &dx in [dx - 1, dx].iter() {
                             for &dz in [dz - 1, dz].iter() {
                                 for &dy in [dy - 1, dy].iter() {
@@ -509,7 +517,7 @@ pub fn fill_buffer(block_states: &BlockStates, biomes: &Biomes, buffer: &mut Vec
                                             let mut above = true;
                                             for (i, &a) in ao_face.direction().iter().enumerate() {
                                                 let da = [dx, dy, dz][i];
-                                                let va = rounded_vertex_xyz[i];
+                                                let va = rounded_xyz[i];
                                                 let above_da = match a {
                                                     -1 => va - 1,
                                                     1 => va,
@@ -541,7 +549,10 @@ pub fn fill_buffer(block_states: &BlockStates, biomes: &Biomes, buffer: &mut Vec
                                     model::Tint::None | model::Tint::Redstone => continue,
                                     model::Tint::Grass | model::Tint::Foliage => {}
                                 }
-                                let [x, z] = [x + dx as usize, z + dz as usize].map(|x| x + 16);
+                                let (x, z) = (
+                                    x.wrapping_add(dx as usize).wrapping_add(16),
+                                    z.wrapping_add(dz as usize).wrapping_add(16),
+                                );
                                 let biome = match column_biomes[z / 16][x / 16] {
                                     Some(biome) => biomes[biome[z % 16][x % 16]],
                                     None => continue
@@ -579,8 +590,7 @@ pub fn fill_buffer(block_states: &BlockStates, biomes: &Biomes, buffer: &mut Vec
                     });
 
                     // Split the clockwise quad into two clockwise triangles.
-                    buffer.push_all(&[v[0], v[1], v[2]]);
-                    buffer.push_all(&[v[2], v[3], v[0]]);
+                    buffer.extend([0,1,2,2,3,0].iter().map(|&i| v[i]));
                 }
             }
         }

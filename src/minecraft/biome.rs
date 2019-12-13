@@ -1,10 +1,11 @@
 use std::ops::Index;
+use std::path::Path;
 
 use chunk::BiomeId;
 use minecraft::data;
-use texture::ColorMap;
+use gfx_voxel::texture::ColorMap;
 
-#[derive(Copy)]
+#[derive(Copy, Clone)]
 pub struct Biome {
     pub name: &'static str,
     pub temperature: f32,
@@ -19,7 +20,7 @@ pub struct Biomes {
 
 impl Biomes {
     pub fn load(assets: &Path) -> Biomes {
-        let mut biomes = box [None; 256];
+        let mut biomes = Box::new([None; 256]);
 
         let grass_colors = Path::new("minecraft/textures/colormap/grass.png");
         let grass_colors = ColorMap::from_path(&assets.join(&grass_colors)).unwrap();
@@ -36,14 +37,14 @@ impl Biomes {
             });
         }
 
-        Biomes { biomes: biomes }
+        Biomes { biomes }
     }
 }
 
 impl Index<BiomeId> for Biomes {
     type Output = Biome;
 
-    fn index<'a>(&'a self, id: &BiomeId) -> &'a Biome {
+    fn index(&self, id: BiomeId) -> &Biome {
         self.biomes[id.value as usize].as_ref().unwrap()
     }
 }
